@@ -3,7 +3,7 @@ import contextlib
 import json
 import logging
 import math
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from types import MappingProxyType
@@ -852,6 +852,11 @@ def _extract_error_from_sse_chunk(event_line: str | bytes) -> dict:
             pass
 
     return default_error
+
+
+async def _empty_byte_stream() -> AsyncGenerator[bytes, None]:
+    for frame in ():
+        yield frame
 
 
 class _UpstreamClosingStreamingResponse(StreamingResponse):
@@ -2868,10 +2873,21 @@ class ProxyBaseLLMRequestProcessing:
                         else:
                             generator = response
 
-                        if (
-                            self._has_post_call_guardrails_for_passthrough()
-                            and self._passthrough_endpoint_has_stream_guardrail_handler()
-                        ):
+                        post_call_guardrails_active: Final = self._has_post_call_guardrails_for_passthrough()
+                        if post_call_guardrails_active and self._passthrough_stream_scans_incrementally():
+                            guarded_stream: Final = await self._guarded_passthrough_event_stream(
+                                generator=generator,
+                                proxy_logging_obj=proxy_logging_obj,
+                                user_api_key_dict=user_api_key_dict,
+                            )
+                            return _UpstreamClosingStreamingResponse(
+                                content=guarded_stream,  # pyright: ignore[reportArgumentType]  # bytes frames on a str-typed StreamingResponse
+                                status_code=getattr(response, "status_code", status.HTTP_200_OK),
+                                media_type=self._passthrough_event_stream_media_type(),
+                                headers={k: v for k, v in streaming_headers.items() if k.lower() != "content-length"},
+                                upstream_generator=generator,
+                            )
+                        if post_call_guardrails_active and self._passthrough_endpoint_has_stream_guardrail_handler():
                             body_bytes: Final = b"".join([chunk async for chunk in generator])
                             modified_bytes: Final = await self._handle_event_stream_allm_passthrough_route(
                                 body_bytes=body_bytes,
@@ -3349,9 +3365,9 @@ class ProxyBaseLLMRequestProcessing:
                 return True
         return False
 
-    def _has_post_call_guardrails_for_passthrough(self) -> bool:
+    def _post_call_guardrails_for_passthrough(self) -> tuple[CustomGuardrail, ...]:
         """
-        True when a post_call guardrail will actually run for THIS request.
+        The post_call guardrails that will actually run for THIS request.
 
         Mirrors the gate in ProxyLogging.post_call_success_hook
         (should_run_guardrail against the request's merged guardrails) so that a
@@ -3364,15 +3380,80 @@ class ProxyBaseLLMRequestProcessing:
         from litellm.proxy.utils import check_and_merge_model_level_guardrails
 
         guardrail_data: Final = check_and_merge_model_level_guardrails(data=self.data, llm_router=llm_router)
-        for cb in litellm.callbacks:
-            if not isinstance(cb, CustomGuardrail):
-                continue
-            if cb.should_run_guardrail(
-                data=guardrail_data,
-                event_type=GuardrailEventHooks.post_call,
-            ):
-                return True
-        return False
+        return tuple(
+            cb
+            for cb in litellm.callbacks
+            if isinstance(cb, CustomGuardrail)
+            and cb.should_run_guardrail(data=guardrail_data, event_type=GuardrailEventHooks.post_call)
+        )
+
+    def _has_post_call_guardrails_for_passthrough(self) -> bool:
+        return bool(self._post_call_guardrails_for_passthrough())
+
+    def _passthrough_stream_scans_incrementally(self) -> bool:
+        """
+        True when this passthrough stream can be relayed frame by frame with the
+        post_call guardrails scanning it as it goes (the chat-completions
+        streaming loop with the provider's event-stream translation): the
+        provider handler can split and read this endpoint's frames, no post_call
+        policy pipeline gates the response, and every applicable guardrail scans
+        through apply_guardrail without rewriting content. A masking guardrail,
+        or one with its own lifecycle hooks, keeps the buffered path where the
+        whole stream is scanned and rewritten before any frame is sent.
+        """
+        from litellm.llms.pass_through.guardrail_translation.handler import (
+            LlmPassthroughRouteHandler,
+        )
+        from litellm.proxy.utils import _post_call_pipelines
+
+        if not LlmPassthroughRouteHandler.supports_event_stream_scan(
+            self.data.get("custom_llm_provider"), self.data.get("endpoint")
+        ):
+            return False
+        if _post_call_pipelines(self.data):
+            return False
+        return all(
+            cb.uses_apply_guardrail_interface()
+            and not cb.use_native_lifecycle_hooks
+            and not getattr(cb, "mask_response_content", False)
+            for cb in self._post_call_guardrails_for_passthrough()
+        )
+
+    async def _guarded_passthrough_event_stream(
+        self,
+        generator: AsyncIterable[bytes],
+        proxy_logging_obj: "ProxyLogging",
+        user_api_key_dict: "UserAPIKeyAuth",
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        The upstream event stream re-chunked into whole frames and run through
+        the post_call streaming guardrail loop. The first frame is awaited here
+        so a guardrail that raises before anything was sent still surfaces as
+        an HTTP error instead of a 200 that dies mid-body.
+        """
+        from litellm.llms.pass_through.guardrail_translation.handler import (
+            LlmPassthroughRouteHandler,
+        )
+
+        frames: Final = LlmPassthroughRouteHandler.iter_event_stream_frames(
+            self.data.get("custom_llm_provider"), generator
+        )
+        guarded: Final = proxy_logging_obj.async_post_call_streaming_iterator_hook(
+            response=frames,
+            user_api_key_dict=user_api_key_dict,
+            request_data=self.data,
+        )
+        try:
+            first_frame: Final = await guarded.__anext__()
+        except StopAsyncIteration:
+            return _empty_byte_stream()
+
+        async def _primed() -> AsyncGenerator[bytes, None]:
+            yield first_frame
+            async for frame in guarded:
+                yield frame
+
+        return _primed()
 
     def _passthrough_endpoint_has_stream_guardrail_handler(self) -> bool:
         """
